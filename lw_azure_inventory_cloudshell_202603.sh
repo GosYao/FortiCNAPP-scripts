@@ -5,10 +5,9 @@
 #
 # Key optimizations vs original:
 #   1. Fetches VM SKU data only for regions with actual VMs/VMSSes (not all global regions)
-#   2. Per-location SKU fetches run in parallel
+#   2. Per-location SKU fetches run sequentially (avoids MSI token contention in Cloud Shell)
 #   3. VM and VMSS Resource Graph queries run in parallel
-#   4. In-memory associative array replaces file+grep for O(1) SKU lookups
-#   5. az account list (cached) replaces az account subscription list
+#   4. az account list (cached) replaces az account subscription list
 #
 # Requirements: az cli, jq
 # Run with bash: ./lw_azure_inventory_cloudshell_202603.sh [-s sub1,sub2] [-m mgmt1,mgmt2]
@@ -17,7 +16,7 @@ function showHelp {
   echo "lw_azure_inventory_cloudshell_202603.sh — FortiCNAPP license vCPU estimator for Azure"
   echo ""
   echo "Scans Azure VMs and VM Scale Sets to estimate vCPU counts for licensing."
-  echo "Optimized for Azure Cloud Shell (parallel SKU fetching, in-memory lookups)."
+  echo "Optimized for Azure Cloud Shell (fetches SKUs only for regions in use)."
   echo ""
   echo "Usage:"
   echo "  ./lw_azure_inventory_cloudshell_202603.sh              # all accessible subscriptions"
@@ -51,10 +50,7 @@ while getopts ":m:s:h" opt; do
 done
 shift $((OPTIND -1))
 
-# ---------------------------------------------------------------------------
-# In-memory SKU map — associative array for O(1) lookups (no tmp file needed)
-# ---------------------------------------------------------------------------
-declare -A SKU_MAP
+SKU_MAP_FILE=""   # populated by buildSkuMapForLocations
 
 function removeTmp {
   [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
@@ -103,8 +99,9 @@ function graphQuery {
 }
 
 # ---------------------------------------------------------------------------
-# OPTIMIZATION: Build SKU map only for locations that actually have VMs/VMSSes.
-# Fetches run in parallel, results loaded into associative array SKU_MAP.
+# Build SKU map only for locations that actually have VMs/VMSSes.
+# Runs sequentially to avoid MSI token contention in Cloud Shell.
+# Result is a sorted flat file: "SkuName:vCPUcount" (one per line).
 # ---------------------------------------------------------------------------
 function buildSkuMapForLocations {
   local locations="$1"   # space-separated region names
@@ -114,46 +111,32 @@ function buildSkuMapForLocations {
     return
   fi
 
-  echo "Fetching VM SKU data for regions (parallel): $locations"
-
   TMP_DIR=$(mktemp -d)
-  local pids=()
+  SKU_MAP_FILE="$TMP_DIR/sku_map"
+
+  echo "Fetching VM SKU data for regions: $locations"
 
   for loc in $locations; do
-    (
-      az vm list-skus \
-        --resource-type virtualmachines \
-        --location "$loc" \
-        --only-show-errors \
-        -o json 2>/dev/null \
-        | jq -r '.[] | .name as $n
-                      | select(.capabilities != null)
-                      | .capabilities[]
-                      | select(.name == "vCPUs")
-                      | $n + ":" + .value' \
-        > "$TMP_DIR/${loc}.skus"
-    ) &
-    pids+=($!)
+    echo "  Loading SKUs for $loc ..."
+    az vm list-skus \
+      --resource-type virtualmachines \
+      --location "$loc" \
+      --only-show-errors \
+      -o json 2>/dev/null \
+      | jq -r '.[] | .name as $n
+                    | select(.capabilities != null)
+                    | .capabilities[]
+                    | select(.name == "vCPUs")
+                    | $n + ":" + .value' \
+      >> "$SKU_MAP_FILE" || echo "  Warning: SKU fetch failed for $loc, skipping."
   done
 
-  # Wait for all parallel fetches to finish
-  local failed=0
-  for pid in "${pids[@]}"; do
-    wait "$pid" || failed=$((failed + 1))
-  done
-  [[ $failed -gt 0 ]] && echo "Warning: $failed location SKU fetch(es) failed (results may be partial)."
+  # Deduplicate (same SKU may appear across locations with identical vCPU count)
+  [[ -f "$SKU_MAP_FILE" ]] && sort -u -o "$SKU_MAP_FILE" "$SKU_MAP_FILE"
 
-  # Load into associative array
-  local count=0
-  for f in "$TMP_DIR"/*.skus; do
-    [[ -s "$f" ]] || continue
-    while IFS=: read -r name vcpus; do
-      SKU_MAP["$name"]="$vcpus"
-      count=$((count + 1))
-    done < "$f"
-  done
-
-  echo "SKU map built: ${#SKU_MAP[@]} unique SKUs loaded."
+  local mapSize=0
+  [[ -f "$SKU_MAP_FILE" ]] && mapSize=$(wc -l < "$SKU_MAP_FILE")
+  echo "SKU map built: $mapSize unique SKUs loaded."
 }
 
 # ---------------------------------------------------------------------------
@@ -174,11 +157,14 @@ function runSubscriptionAnalysis {
   # Running VMs
   local VM_LINES
   VM_LINES=$(echo "$vms" | jq -r --arg sid "$subscriptionId" \
-    '.data[] | select(.subscriptionId==$sid) | select(.powerState=="PowerState/running") | .sku')
+    '.data[] | select(.subscriptionId==$sid) | select(.powerState=="PowerState/running") | .sku // empty')
 
   if [[ -n "$VM_LINES" ]]; then
     while read -r sku; do
-      local vCPU="${SKU_MAP[$sku]:-}"
+      # Guard: skip null/empty SKUs (VMs with no extended instance view data)
+      [[ -z "$sku" || "$sku" == "null" ]] && continue
+      local vCPU
+      vCPU=$(grep -m1 "^${sku}:" "$SKU_MAP_FILE" 2>/dev/null | cut -d: -f2) || true
       if [[ -n "$vCPU" ]]; then
         subscriptionVmCount=$((subscriptionVmCount + 1))
         subscriptionVmVcpu=$((subscriptionVmVcpu + vCPU))
@@ -189,13 +175,16 @@ function runSubscriptionAnalysis {
   # VMSS (all instances regardless of power state)
   local VMSS_LINES
   VMSS_LINES=$(echo "$vmss" | jq -r --arg sid "$subscriptionId" \
-    '.data[] | select(.subscriptionId==$sid) | .sku+":"+(.capacity // 0 | tostring)')
+    '.data[] | select(.subscriptionId==$sid) | (.sku // empty) +":"+(.capacity // 0 | tostring)')
 
   if [[ -n "$VMSS_LINES" ]]; then
     while read -r line; do
       local sku="${line%%:*}"
       local capacity="${line##*:}"
-      local vCPU="${SKU_MAP[$sku]:-}"
+      # Guard: skip null/empty SKUs
+      [[ -z "$sku" || "$sku" == "null" ]] && continue
+      local vCPU
+      vCPU=$(grep -m1 "^${sku}:" "$SKU_MAP_FILE" 2>/dev/null | cut -d: -f2) || true
       if [[ -n "$vCPU" && "$capacity" -gt 0 ]]; then
         subscriptionVmssVcpu=$((subscriptionVmssVcpu + vCPU * capacity))
         subscriptionVmssVmCount=$((subscriptionVmssVmCount + capacity))
