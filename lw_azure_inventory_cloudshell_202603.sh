@@ -10,7 +10,7 @@
 #   4. az account list (cached) replaces az account subscription list
 #
 # Requirements: az cli, jq
-# Run with bash: ./lw_azure_inventory_cloudshell_202603.sh [-s sub1,sub2] [-m mgmt1,mgmt2]
+# Run with bash: ./lw_azure_inventory_cloudshell_202603.sh [-s sub1,sub2] [-m mgmt1,mgmt2] [-r eastus,westeurope]
 
 function showHelp {
   echo "lw_azure_inventory_cloudshell_202603.sh — FortiCNAPP license vCPU estimator for Azure"
@@ -19,13 +19,15 @@ function showHelp {
   echo "Optimized for Azure Cloud Shell (fetches SKUs only for regions in use)."
   echo ""
   echo "Usage:"
-  echo "  ./lw_azure_inventory_cloudshell_202603.sh              # all accessible subscriptions"
-  echo "  ./lw_azure_inventory_cloudshell_202603.sh -s sub1,sub2 # specific subscriptions"
-  echo "  ./lw_azure_inventory_cloudshell_202603.sh -m mgmt1     # management group scope"
+  echo "  ./lw_azure_inventory_cloudshell_202603.sh                        # all accessible subscriptions"
+  echo "  ./lw_azure_inventory_cloudshell_202603.sh -s sub1,sub2          # specific subscriptions"
+  echo "  ./lw_azure_inventory_cloudshell_202603.sh -m mgmt1              # management group scope"
+  echo "  ./lw_azure_inventory_cloudshell_202603.sh -r eastus,westeurope  # limit to specific regions"
   echo ""
   echo "Flags:"
   echo "  -s   Comma-separated subscription IDs"
   echo "  -m   Comma-separated management group IDs (takes precedence over -s)"
+  echo "  -r   Comma-separated Azure region names to include (filters VMs and VMSSes)"
   echo "  -h   Show this help"
 }
 
@@ -39,10 +41,13 @@ fi
 set -o errexit
 set -o pipefail
 
-while getopts ":m:s:h" opt; do
+REGIONS=""
+
+while getopts ":m:r:s:h" opt; do
   case ${opt} in
     s ) SUBSCRIPTION=$OPTARG ;;
     m ) MANAGEMENT_GROUP=$OPTARG ;;
+    r ) REGIONS=$OPTARG ;;
     h ) showHelp; exit 0 ;;
     \? ) showHelp; exit 1 ;;
     : ) showHelp; exit 1 ;;
@@ -239,6 +244,15 @@ function runAnalysis {
   vms=$(cat "$vm_file")
   vmss=$(cat "$vmss_file")
   rm -f "$subs_file" "$vm_file" "$vmss_file"
+
+  # Apply region filter (-r flag) if specified
+  if [[ -n "$REGIONS" ]]; then
+    local region_filter
+    region_filter=$(echo "$REGIONS" | tr ',' '\n' | jq -Rsc '[split("\n")[] | select(length>0)]')
+    echo "Filtering to regions: $REGIONS"
+    vms=$(echo  "$vms"  | jq --argjson r "$region_filter" '{"data": [.data[] | select(.location as $l | $r | index($l) != null)]}')
+    vmss=$(echo "$vmss" | jq --argjson r "$region_filter" '{"data": [.data[] | select(.location as $l | $r | index($l) != null)]}')
+  fi
 
   # Collect only the regions that have actual VMs or VMSSes
   local vm_locations vmss_locations all_locations
