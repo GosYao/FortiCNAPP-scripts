@@ -57,7 +57,8 @@ function Invoke-GraphQuery {
     $pageSize = 1000
 
     do {
-        $p = @{ Query = $Query; First = $pageSize; Skip = $skip }
+        $p = @{ Query = $Query; First = $pageSize }
+        if ($skip -gt 0)         { $p.Skip          = $skip }
         if ($ManagementGroups) { $p.ManagementGroup = $ManagementGroups }
         elseif ($Subscriptions)  { $p.Subscription  = $Subscriptions }
 
