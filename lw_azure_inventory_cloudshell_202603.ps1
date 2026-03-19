@@ -62,7 +62,11 @@ function Invoke-GraphQuery {
         if ($ManagementGroups) { $p.ManagementGroup = $ManagementGroups }
         elseif ($Subscriptions)  { $p.Subscription  = $Subscriptions }
 
-        $page  = @(Search-AzGraph @p)
+        $raw  = Search-AzGraph @p
+        if ($null -eq $raw) { break }
+        # Normalise: newer Az.ResourceGraph versions return a PSResourceGraphResponse
+        # wrapper with a .Data property; older versions return PSObject[] directly.
+        $page = if ($raw.PSObject.Properties.Name -contains 'Data') { @($raw.Data) } else { @($raw) }
         $count = $page.Count
         if ($count -gt 0) { $all.AddRange($page) }
         $skip += $pageSize
@@ -94,7 +98,7 @@ function Build-LocationSkuMap {
                       Where-Object { $_.ResourceType -eq "virtualMachines" })
             foreach ($sku in $skus) {
                 if ($map.ContainsKey($sku.Name)) { continue }
-                $cap = $sku.Capabilities | Where-Object { $_.Name -eq "vCPUs" }
+                $cap = $sku.Capabilities | Where-Object { $_.Name -eq "vCPUs" } | Select-Object -First 1
                 if ($cap) { $map[$sku.Name] = [int]$cap.Value }
             }
         } catch {
@@ -178,9 +182,9 @@ function Invoke-Analysis {
 
     # Collect unique locations that have actual VMs or VMSSes — scope the SKU fetch
     $locations = @(
-        ($vms  | Select-Object -ExpandProperty location -Unique) +
-        ($vmss | Select-Object -ExpandProperty location -Unique)
-    ) | Select-Object -Unique | Sort-Object
+        @($vms  | Select-Object -ExpandProperty location -Unique) +
+        @($vmss | Select-Object -ExpandProperty location -Unique)
+    ) | Where-Object { $_ } | Select-Object -Unique | Sort-Object
 
     $skuMap = Build-LocationSkuMap -Locations $locations
     $totals = @{ VmCount = 0; VmVcpu = 0; VsCount = 0; VsVmCount = 0; VsVcpu = 0 }

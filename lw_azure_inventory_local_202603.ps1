@@ -62,7 +62,11 @@ function Invoke-GraphQuery {
         if ($ManagementGroups) { $p.ManagementGroup = $ManagementGroups }
         elseif ($Subscriptions)  { $p.Subscription  = $Subscriptions }
 
-        $page  = @(Search-AzGraph @p)
+        $raw  = Search-AzGraph @p
+        if ($null -eq $raw) { break }
+        # Normalise: newer Az.ResourceGraph versions return a PSResourceGraphResponse
+        # wrapper with a .Data property; older versions return PSObject[] directly.
+        $page = if ($raw.PSObject.Properties.Name -contains 'Data') { @($raw.Data) } else { @($raw) }
         $count = $page.Count
         if ($count -gt 0) { $all.AddRange($page) }
         $skip += $pageSize
@@ -81,7 +85,7 @@ function Build-SkuMap {
     $skus = Get-AzComputeResourceSku | Where-Object { $_.ResourceType -eq "virtualMachines" }
     foreach ($sku in $skus) {
         if ($map.ContainsKey($sku.Name)) { continue }
-        $cap = $sku.Capabilities | Where-Object { $_.Name -eq "vCPUs" }
+        $cap = $sku.Capabilities | Where-Object { $_.Name -eq "vCPUs" } | Select-Object -First 1
         if ($cap) { $map[$sku.Name] = [int]$cap.Value }
     }
     Write-Host "SKU map built: $($map.Count) unique SKUs loaded."
